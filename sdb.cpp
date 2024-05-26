@@ -12,11 +12,19 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <iomanip>
+#include <map>
 #include <capstone/capstone.h>
 using namespace std;
 
 pid_t child_pid = -1;
 string program;
+int max_breakpoint_index = 0, breakpoint_num = 0;
+
+struct BreakpointInfo {
+    uint8_t original_data;
+    int index;
+};
+map<uintptr_t, BreakpointInfo> breakpoints;
 
 void handle_command(const string &command);
 void init_debugger(const string &program);
@@ -25,6 +33,9 @@ void disassemble();
 void step();
 void cont();
 void info_register();
+void set_breakpoint(uintptr_t address);
+void delete_breakpoint(int index);
+void info_breakpoint();
 
 
 int main(int argc, char* argv[]) {
@@ -53,22 +64,48 @@ void handle_command(const string &command) {
         init_debugger(program);
     } else if (command == "si") {
         if (child_pid == -1) {
-            std::cerr << "** please load a program first.\n";
+            cerr << "** please load a program first.\n";
             return;
         }
         step();
     } else if (command == "cont") {
         if (child_pid == -1) {
-            std::cerr << "** please load a program first.\n";
+            cerr << "** please load a program first.\n";
             return;
         }
         cont();
     } else if (command == "info reg") {
         if (child_pid == -1) {
-            std::cerr << "** please load a program first.\n";
+            cerr << "** please load a program first.\n";
             return;
         }
         info_register();
+    } else if (command.substr(0, 5) == "break") {
+        if (child_pid == -1) {
+            cerr << "** please load a program first.\n";
+            return;
+        }
+        string address_str = command.substr(6);
+        if(address_str.substr(0, 2) != "0x") address_str = "0x" + address_str;
+        size_t pos;
+        uintptr_t address = stoul(address_str, &pos, 16);
+        if (pos != address_str.size()) {
+            cerr << "Invalid address format.\n" << endl;
+            return;
+        }
+        set_breakpoint(address);
+    } else if (command.substr(0, 6) == "delete") {
+        if (child_pid == -1) {
+            cerr << "** please load a program first.\n";
+            return;
+        }
+        delete_breakpoint(stoi(command.substr(7)));
+    } else if (command == "info break") {
+        if (child_pid == -1) {
+            cerr << "** please load a program first.\n";
+            return;
+        }
+        info_breakpoint();
     } else {
         cerr << "Unknown command: " << command << "\n";
     }
@@ -190,6 +227,67 @@ void cont() {
     if (WIFEXITED(status)) {
         cout << "** the target program terminated." << endl;
         child_pid = -1;
+    }
+}
+
+
+void set_breakpoint(uintptr_t address) {
+    long data = ptrace(PTRACE_PEEKTEXT, child_pid, address, 0);
+    uint8_t original_data = data & 0xFF;
+    breakpoints[address] = {original_data, max_breakpoint_index++};
+    long trap = (data & ~0xFF) | 0xCC;
+    ptrace(PTRACE_POKETEXT, child_pid, address, trap);
+    breakpoint_num++;
+    cout << "** set a breakpoint at 0x" << hex << address << "." << endl;
+}
+
+
+void delete_breakpoint(int index) {
+    for (const auto& it : breakpoints) {
+        if (it.second.index == index) {
+            // restore instruction
+            uintptr_t address = it.first;
+            long data = ptrace(PTRACE_PEEKTEXT, child_pid, address, 0);
+            long restored = (data & ~0xFF) | it.second.original_data;
+            ptrace(PTRACE_POKETEXT, child_pid, address, restored);
+
+            breakpoints.erase(it.first);
+            breakpoint_num--;
+            cout << "** delete breakpoint " << index << ".\n";
+            return;
+        }
+    }
+    cout << "** breakpoint " << index << " does not exist.\n";
+}
+
+
+void handle_breakpoint(uintptr_t address) {
+    cout << "** hit a breakpoint at 0x" << hex << address << "." << endl;
+    delete_breakpoint(address);
+    ptrace(PTRACE_SINGLESTEP, child_pid, 0, 0);
+    waitpid(child_pid, nullptr, 0);
+    set_breakpoint(address);
+    disassemble();
+}
+
+
+void info_breakpoint() {
+    if (breakpoint_num == 0) {
+        cout << "** no breakpoints.\n";
+        return;
+    }
+    
+    vector<uintptr_t> breakpoints_vec;
+    breakpoints_vec.resize(max_breakpoint_index);
+
+    for (const auto& it : breakpoints) {
+        breakpoints_vec[it.second.index] = it.first;
+    }
+    cout << setw(10) << setfill(' ') << "Num" << "Address\n";
+    for (int i = 0; i < max_breakpoint_index; i++) {
+        if (breakpoints_vec[i]) {
+            cout << setw(10) << setfill(' ') << i << hex << "0x" << breakpoints_vec[i] << endl;
+        }
     }
 }
 
