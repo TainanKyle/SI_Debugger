@@ -20,19 +20,17 @@ using namespace std;
 
 
 pid_t child_pid = -1;
-string program;
 int max_breakpoint_index = 0, breakpoint_num = 0;
 uintptr_t hit_breakpoint_address = 0;
 bool in_syscall = false;
-uint64_t text_section_start = 0;
-uint64_t text_section_end = 0;
-
+uint64_t text_section_start = 0, text_section_end = 0;
 
 struct BreakpointInfo {
     uint8_t original_data;
     int index;
 };
 map<uintptr_t, BreakpointInfo> breakpoints;
+
 
 void handle_command(const string &command);
 void init_debugger(const string &program);
@@ -52,7 +50,7 @@ void load_text_section_range(const string filename);
 
 int main(int argc, char* argv[]) {
     if (argc == 2) {
-        program = argv[1];
+        string program = argv[1];
         init_debugger(program);
     }
     
@@ -74,31 +72,37 @@ void handle_command(const string &command) {
         }
         string program = command.substr(5);
         init_debugger(program);
+
     } else if (command == "si") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
             return;
         }
         step();
+
     } else if (command == "cont") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
             return;
         }
         cont();
+
     } else if (command == "info reg") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
             return;
         }
         info_register();
+
     } else if (command.substr(0, 5) == "break") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
             return;
         }
+
         string address_str = command.substr(6);
         if(address_str.substr(0, 2) != "0x") address_str = "0x" + address_str;
+        // convert string into uintptr_t
         size_t pos;
         uintptr_t address = stoul(address_str, &pos, 16);
         if (pos != address_str.size()) {
@@ -106,18 +110,21 @@ void handle_command(const string &command) {
             return;
         }
         set_breakpoint(address);
+
     } else if (command.substr(0, 6) == "delete") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
             return;
         }
         delete_breakpoint(stoi(command.substr(7)));
+
     } else if (command == "info break") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
             return;
         }
         info_breakpoint();
+
     } else if (command.substr(0, 5) == "patch") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
@@ -132,12 +139,14 @@ void handle_command(const string &command) {
 
         iss >> op >> hex >> address >> hex >> value >> dec >> len;
         patch(address, value, len);
+
     } else if (command == "syscall") {
         if (child_pid == -1) {
             cerr << "** please load a program first.\n";
             return;
         }
         system_call();
+
     } else {
         cerr << "Unknown command: " << command << "\n";
     }
@@ -148,9 +157,11 @@ void init_debugger(const string &program) {
     child_pid = fork();
 
     if (child_pid < 0) cerr << "Failed to fork.\n";
-    else if (child_pid == 0) {   // child process
+    // child process
+    else if (child_pid == 0) {   
         ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
         execl(program.c_str(), program.c_str(), nullptr);
+
     } else {    // parent process
         int status;
         if(waitpid(child_pid, &status, 0) < 0) cerr << "wait\n";
@@ -161,6 +172,7 @@ void init_debugger(const string &program) {
         }
         ptrace(PTRACE_SETOPTIONS, child_pid, 0, PTRACE_O_EXITKILL);
 
+        // get entry point
         uintptr_t entry_point = get_entry_point(program);
         if (entry_point == 0) {
             cerr << "Failed to obtain entry point.\n";
@@ -207,6 +219,7 @@ void disassemble(uint64_t address) {
     size_t count;
     csh handle;
 
+    // capstone disassemble
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
         perror("cs_open");
         exit(1);
@@ -225,6 +238,7 @@ void disassemble(uint64_t address) {
         }
     }
 
+    // disassemble
     count = cs_disasm(handle, code, sizeof(code), address, 0, &insn);
     size_t i = 0;
     if (count > 0) {
@@ -259,7 +273,7 @@ void step() {
         return;
     }
     
-    // Reset breakpoint
+    // Reset breakpoint that have executed
     if (hit_breakpoint_address != 0) {
         long data = ptrace(PTRACE_PEEKTEXT, child_pid, hit_breakpoint_address, 0);
         long trap = (data & ~0xFF) | 0xCC;
@@ -282,6 +296,7 @@ void cont() {
     if (WIFEXITED(status)) {
         cout << "** the target program terminated." << endl;
         child_pid = -1;
+
     } else if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
         // Reset breakpoint
         if (hit_breakpoint_address != 0) {
@@ -311,6 +326,7 @@ void set_breakpoint(uintptr_t address) {
 
 
 void delete_breakpoint(int index) {
+    // find the breakpoint in breakpoints
     for (const auto& it : breakpoints) {
         if (it.second.index == index) {
             // restore instruction
@@ -319,6 +335,7 @@ void delete_breakpoint(int index) {
             long restored = (data & ~0xFF) | it.second.original_data;
             ptrace(PTRACE_POKETEXT, child_pid, address, restored);
 
+            // delete the breakpoint from breakpoints
             breakpoints.erase(it.first);
             breakpoint_num--;
             cout << "** delete breakpoint " << index << ".\n";
@@ -333,6 +350,7 @@ void delete_breakpoint(int index) {
 void check_breakpoint(bool isStep) {
     struct user_regs_struct regs;
     ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
+    // rip need to -1 in the cases of continue and syscall
     uintptr_t address = (!isStep) ? regs.rip - 1 : regs.rip;
 
     if (breakpoints.find(address) != breakpoints.end()) {
@@ -341,7 +359,7 @@ void check_breakpoint(bool isStep) {
         long restored = (ptrace(PTRACE_PEEKTEXT, child_pid, address, 0) & ~0xFF) | bp_info.original_data;
         ptrace(PTRACE_POKETEXT, child_pid, address, restored);
 
-        // move rip back
+        // move rip back in the cases of continue and syscall
         if (!isStep) {
             regs.rip -= 1;
             ptrace(PTRACE_SETREGS, child_pid, 0, &regs);
@@ -362,6 +380,7 @@ void info_breakpoint() {
     vector<uintptr_t> breakpoints_vec;
     breakpoints_vec.resize(max_breakpoint_index);
 
+    // use vector to sort breakpoints by index
     for (const auto& it : breakpoints) {
         breakpoints_vec[it.second.index] = it.first;
     }
@@ -389,12 +408,12 @@ void patch(uintptr_t address, uint64_t value, int len) {
     ptrace(PTRACE_POKETEXT, child_pid, address, data);
     cout << "** patch memory at address 0x" << hex << address << ".\n";
 
-    // Restore breakpoint
+    // Reset breakpoint
     for(int i = 0; i < len; i++) {
         uintptr_t addr = address + i;
         if (breakpoints.find(addr) != breakpoints.end()) {
             long data = ptrace(PTRACE_PEEKTEXT, child_pid, addr, 0);
-            breakpoints[addr].original_data = data & 0xFF;
+            breakpoints[addr].original_data = data & 0xFF;  // update original data
             long trap = (data & ~0xFF) | 0xCC;
             ptrace(PTRACE_POKETEXT, child_pid, addr, trap);
         }
@@ -409,6 +428,7 @@ void system_call() {
 
     if (WIFEXITED(status)) {
         cout << "** the target program terminated." << endl;
+        child_pid = -1;
         return;
     }
 
@@ -429,6 +449,7 @@ void system_call() {
         }
     } 
     else {
+        // leave syscall
         if (regs.orig_rax != (unsigned long long)-1) {
             cout << "** leave a syscall(" << dec << regs.orig_rax << ") = " << dec << regs.rax << " at 0x" << hex << regs.rip - 2 << ".\n";
             in_syscall = false;
@@ -483,6 +504,7 @@ void load_text_section_range(const string filename) {
         exit(1);
     }
 
+    // file information
     struct stat st;
     if (fstat(fd, &st) < 0) {
         perror("fstat");
@@ -490,17 +512,21 @@ void load_text_section_range(const string filename) {
         exit(1);
     }
 
+    // map whole elf into memory
     void* map_start = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map_start == MAP_FAILED) {
         perror("mmap");
         close(fd);
         exit(1);
     }
-
     Elf64_Ehdr* ehdr = (Elf64_Ehdr*)map_start;
+
+    // section header table
     Elf64_Shdr* shdr = (Elf64_Shdr*)((char*)map_start + ehdr->e_shoff);
+    // section header string table
     char* shstrtab = (char*)map_start + shdr[ehdr->e_shstrndx].sh_offset;
 
+    // find .text section
     for (int i = 0; i < ehdr->e_shnum; i++) {
         if (strcmp(shstrtab + shdr[i].sh_name, ".text") == 0) {
             text_section_start = shdr[i].sh_addr;
