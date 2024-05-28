@@ -13,12 +13,17 @@
 #include <fcntl.h>
 #include <iomanip>
 #include <map>
+#include <sstream>
 #include <capstone/capstone.h>
 using namespace std;
+
 
 pid_t child_pid = -1;
 string program;
 int max_breakpoint_index = 0, breakpoint_num = 0;
+uintptr_t hit_breakpoint_address = 0;
+bool in_syscall = false;
+
 
 struct BreakpointInfo {
     uint8_t original_data;
@@ -29,13 +34,16 @@ map<uintptr_t, BreakpointInfo> breakpoints;
 void handle_command(const string &command);
 void init_debugger(const string &program);
 uintptr_t get_entry_point(const string &filename);
-void disassemble();
+void disassemble(uint64_t address);
 void step();
 void cont();
 void info_register();
 void set_breakpoint(uintptr_t address);
 void delete_breakpoint(int index);
 void info_breakpoint();
+void check_breakpoint(bool isStep);
+void patch(uintptr_t address, uint64_t value, int len);
+void system_call();
 
 
 int main(int argc, char* argv[]) {
@@ -106,6 +114,26 @@ void handle_command(const string &command) {
             return;
         }
         info_breakpoint();
+    } else if (command.substr(0, 5) == "patch") {
+        if (child_pid == -1) {
+            cerr << "** please load a program first.\n";
+            return;
+        }
+
+        istringstream iss(command);
+        string op;
+        uintptr_t address;
+        uint64_t value;
+        int len;
+
+        iss >> op >> hex >> address >> hex >> value >> dec >> len;
+        patch(address, value, len);
+    } else if (command == "syscall") {
+        if (child_pid == -1) {
+            cerr << "** please load a program first.\n";
+            return;
+        }
+        system_call();
     } else {
         cerr << "Unknown command: " << command << "\n";
     }
@@ -136,7 +164,9 @@ void init_debugger(const string &program) {
         }
         cout << "** program '" << program << "' loaded. entry point 0x" << hex << entry_point << ".\n";
 
-        disassemble();
+        struct user_regs_struct regs;
+        ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
+        disassemble(regs.rip);
     } 
 }
 
@@ -166,10 +196,10 @@ uintptr_t get_entry_point(const string &filename) {
 }
 
 
-void disassemble() {
-    struct user_regs_struct regs;
-    ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
-    uint64_t address = regs.rip;
+void disassemble(uint64_t address) {
+    // struct user_regs_struct regs;
+    // ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
+    // uint64_t address = regs.rip;
     
     cs_insn *insn;
     size_t count;
@@ -186,13 +216,20 @@ void disassemble() {
         code[i] = ptrace(PTRACE_PEEKTEXT, child_pid, address + i, nullptr);
     }
 
+    // Restore original instruction of breakpoints
+    for (int i = 0; i < 64; ++i) {
+        if (breakpoints.find(address + i) != breakpoints.end()) {
+            code[i] = breakpoints[address + i].original_data;
+        }
+    }
+
     count = cs_disasm(handle, code, sizeof(code), address, 0, &insn);
     size_t i = 0;
     if (count > 0) {
         for (i = 0; i < count && i < 5; ++i) {
             cout << "      " << hex << insn[i].address << ": ";
             for (size_t j = 0; j < insn[i].size; ++j) {
-                cout << setw(2) << setfill('0') << hex << (int)insn[i].bytes[j] << " ";
+                cout << setw(2) << setfill('0') << right << hex << (int)insn[i].bytes[j] << " ";
             }
             int num_spaces = 32 - (insn[i].size * 3);
             cout << string(num_spaces, ' ') << left << setw(10) << setfill(' ') << insn[i].mnemonic << " " << insn[i].op_str << endl;
@@ -206,6 +243,7 @@ void disassemble() {
 
 
 void step() {
+    // do step
     ptrace(PTRACE_SINGLESTEP, child_pid, nullptr, nullptr);
     int status;
     waitpid(child_pid, &status, 0);
@@ -215,18 +253,43 @@ void step() {
         child_pid = -1;
         return;
     }
+    
+    // Reset breakpoint
+    if (hit_breakpoint_address != 0) {
+        long data = ptrace(PTRACE_PEEKTEXT, child_pid, hit_breakpoint_address, 0);
+        long trap = (data & ~0xFF) | 0xCC;
+        ptrace(PTRACE_POKETEXT, child_pid, hit_breakpoint_address, trap);
+        hit_breakpoint_address = 0;
+    }
 
-    disassemble();
+    check_breakpoint(true);
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
+    disassemble(regs.rip);
 }
 
 
 void cont() {
+    // do continue
     int status;
     ptrace(PTRACE_CONT, child_pid, nullptr, nullptr);
     waitpid(child_pid, &status, 0);
     if (WIFEXITED(status)) {
         cout << "** the target program terminated." << endl;
         child_pid = -1;
+    } else if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+        // Reset breakpoint
+        if (hit_breakpoint_address != 0) {
+            long data = ptrace(PTRACE_PEEKTEXT, child_pid, hit_breakpoint_address, 0);
+            long trap = (data & ~0xFF) | 0xCC;
+            ptrace(PTRACE_POKETEXT, child_pid, hit_breakpoint_address, trap);
+            hit_breakpoint_address = 0;
+        }
+
+        check_breakpoint(false);
+        struct user_regs_struct regs;
+        ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
+        disassemble(regs.rip);
     }
 }
 
@@ -261,13 +324,27 @@ void delete_breakpoint(int index) {
 }
 
 
-void handle_breakpoint(uintptr_t address) {
-    cout << "** hit a breakpoint at 0x" << hex << address << "." << endl;
-    delete_breakpoint(address);
-    ptrace(PTRACE_SINGLESTEP, child_pid, 0, 0);
-    waitpid(child_pid, nullptr, 0);
-    set_breakpoint(address);
-    disassemble();
+
+void check_breakpoint(bool isStep) {
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
+    uintptr_t address = (!isStep) ? regs.rip - 1 : regs.rip;
+
+    if (breakpoints.find(address) != breakpoints.end()) {
+        // restore original instruction
+        struct BreakpointInfo bp_info = breakpoints[address];
+        long restored = (ptrace(PTRACE_PEEKTEXT, child_pid, address, 0) & ~0xFF) | bp_info.original_data;
+        ptrace(PTRACE_POKETEXT, child_pid, address, restored);
+
+        // move rip back
+        if (!isStep) {
+            regs.rip -= 1;
+            ptrace(PTRACE_SETREGS, child_pid, 0, &regs);
+        }
+
+        hit_breakpoint_address = address;
+        cout << "** hit a breakpoint at 0x" << hex << address << ".\n";
+    }
 }
 
 
@@ -292,8 +369,77 @@ void info_breakpoint() {
 }
 
 
+void patch(uintptr_t address, uint64_t value, int len) {
+    if (len != 1 && len != 2 && len != 4 && len != 8) {
+        cerr << "Invalid patch length." << endl;
+        return;
+    }
+
+    long data = ptrace(PTRACE_PEEKTEXT, child_pid, address, 0);
+    long mask = (1UL << (len * 8)) - 1;
+    value &= mask;
+
+    // patch memory
+    data = (data & ~mask) | value;
+    ptrace(PTRACE_POKETEXT, child_pid, address, data);
+    cout << "** patch memory at address 0x" << hex << address << ".\n";
+
+    // Restore breakpoint
+    for(int i = 0; i < len; i++) {
+        uintptr_t addr = address + i;
+        if (breakpoints.find(addr) != breakpoints.end()) {
+            long data = ptrace(PTRACE_PEEKTEXT, child_pid, addr, 0);
+            breakpoints[addr].original_data = data & 0xFF;
+            long trap = (data & ~0xFF) | 0xCC;
+            ptrace(PTRACE_POKETEXT, child_pid, addr, trap);
+        }
+    }
+}
+
+
+void system_call() {
+    ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
+    int status;
+    waitpid(child_pid, &status, 0);
+
+    if (WIFEXITED(status)) {
+        cout << "** the target program terminated." << endl;
+        return;
+    }
+
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
+    
+    if (!in_syscall) {
+        // syscall
+        if (regs.orig_rax != (unsigned long long)-1) {
+            // move rip back (syscall is two words)
+            // regs.rip -= 2;
+            // ptrace(PTRACE_SETREGS, child_pid, 0, &regs);
+            cout << "** enter a syscall(" << dec << regs.orig_rax << ") at 0x" << hex << regs.rip - 2 << ".\n";
+            in_syscall = true;
+            disassemble(regs.rip - 2);
+        } else {
+            // check point
+            check_breakpoint(false);
+            disassemble(regs.rip);
+        }
+    } 
+    else {
+        if (regs.orig_rax != (unsigned long long)-1) {
+            cout << "** leave a syscall(" << dec << regs.orig_rax << ") = " << dec << regs.rax << " at 0x" << hex << regs.rip - 2 << ".\n";
+            in_syscall = false;
+            disassemble(regs.rip - 2);
+        } else {
+            check_breakpoint(false);
+            disassemble(regs.rip);
+        }
+    }
+}
+
+
 void print_register(const string &name, long value) {
-    cout << "$" << setw(3) << setfill(' ') << name << " 0x" << setw(16) << setfill('0') << hex << value << "    ";
+    cout << "$" << setw(3) << setfill(' ') << name << " 0x" << setw(16) << setfill('0') << right << hex << value << "    ";
 }
 
 void info_register() {
