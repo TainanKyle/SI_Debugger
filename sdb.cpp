@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <map>
 #include <sstream>
+#include <sys/mman.h>
 #include <capstone/capstone.h>
 using namespace std;
 
@@ -23,6 +24,8 @@ string program;
 int max_breakpoint_index = 0, breakpoint_num = 0;
 uintptr_t hit_breakpoint_address = 0;
 bool in_syscall = false;
+uint64_t text_section_start = 0;
+uint64_t text_section_end = 0;
 
 
 struct BreakpointInfo {
@@ -44,6 +47,7 @@ void info_breakpoint();
 void check_breakpoint(bool isStep);
 void patch(uintptr_t address, uint64_t value, int len);
 void system_call();
+void load_text_section_range(const string filename);
 
 
 int main(int argc, char* argv[]) {
@@ -164,6 +168,8 @@ void init_debugger(const string &program) {
         }
         cout << "** program '" << program << "' loaded. entry point 0x" << hex << entry_point << ".\n";
 
+        load_text_section_range(program);
+
         struct user_regs_struct regs;
         ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
         disassemble(regs.rip);
@@ -197,10 +203,6 @@ uintptr_t get_entry_point(const string &filename) {
 
 
 void disassemble(uint64_t address) {
-    // struct user_regs_struct regs;
-    // ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
-    // uint64_t address = regs.rip;
-    
     cs_insn *insn;
     size_t count;
     csh handle;
@@ -227,6 +229,10 @@ void disassemble(uint64_t address) {
     size_t i = 0;
     if (count > 0) {
         for (i = 0; i < count && i < 5; ++i) {
+            if (insn[i].address < text_section_start || insn[i].address >= text_section_end) {
+                cout << "** the address is out of the range of the text section." << endl;
+                break;
+            }
             cout << "      " << hex << insn[i].address << ": ";
             for (size_t j = 0; j < insn[i].size; ++j) {
                 cout << setw(2) << setfill('0') << right << hex << (int)insn[i].bytes[j] << " ";
@@ -236,7 +242,6 @@ void disassemble(uint64_t address) {
         }
         cs_free(insn, count);
     } 
-    if (i < 5) cout << "** the address is out of the range of the text section." << endl;
 
     cs_close(&handle);
 }
@@ -413,15 +418,13 @@ void system_call() {
     if (!in_syscall) {
         // syscall
         if (regs.orig_rax != (unsigned long long)-1) {
-            // move rip back (syscall is two words)
-            // regs.rip -= 2;
-            // ptrace(PTRACE_SETREGS, child_pid, 0, &regs);
             cout << "** enter a syscall(" << dec << regs.orig_rax << ") at 0x" << hex << regs.rip - 2 << ".\n";
             in_syscall = true;
             disassemble(regs.rip - 2);
         } else {
             // check point
             check_breakpoint(false);
+            ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
             disassemble(regs.rip);
         }
     } 
@@ -432,6 +435,7 @@ void system_call() {
             disassemble(regs.rip - 2);
         } else {
             check_breakpoint(false);
+            ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
             disassemble(regs.rip);
         }
     }
@@ -469,4 +473,47 @@ void info_register() {
     print_register("rip", regs.rip);
     print_register("eflags", regs.eflags);
     cout << endl;
+}
+
+
+void load_text_section_range(const string filename) {
+    int fd = open(filename.c_str(), O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        exit(1);
+    }
+
+    void* map_start = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_start == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        exit(1);
+    }
+
+    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)map_start;
+    Elf64_Shdr* shdr = (Elf64_Shdr*)((char*)map_start + ehdr->e_shoff);
+    char* shstrtab = (char*)map_start + shdr[ehdr->e_shstrndx].sh_offset;
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        if (strcmp(shstrtab + shdr[i].sh_name, ".text") == 0) {
+            text_section_start = shdr[i].sh_addr;
+            text_section_end = shdr[i].sh_addr + shdr[i].sh_size;
+            break;
+        }
+    }
+
+    munmap(map_start, st.st_size);
+    close(fd);
+
+    if (text_section_start == 0 || text_section_end == 0) {
+        cerr << "Failed to find .text section in ELF file." << endl;
+        exit(1);
+    }
 }
