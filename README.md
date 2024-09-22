@@ -4,7 +4,7 @@
 Implement a simple instruction-level debugger that allows a user to debug a program interactively at the assembly instruction level.
 The debugger is implemented by using the ptrace interface.
 
-### Commands
+### Available Commands
 - Load Program
 - Step Instruction
 - Continue
