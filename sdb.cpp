@@ -289,8 +289,26 @@ void step() {
 
 
 void cont() {
-    // do continue
+    // do step
+    ptrace(PTRACE_SINGLESTEP, child_pid, nullptr, nullptr);
     int status;
+    waitpid(child_pid, &status, 0);
+
+    if (WIFEXITED(status)) {
+        cout << "** the target program terminated." << endl;
+        child_pid = -1;
+        return;
+    }
+
+    // Reset breakpoint that have executed
+    if (hit_breakpoint_address != 0) {
+        long data = ptrace(PTRACE_PEEKTEXT, child_pid, hit_breakpoint_address, 0);
+        long trap = (data & ~0xFF) | 0xCC;
+        ptrace(PTRACE_POKETEXT, child_pid, hit_breakpoint_address, trap);
+        hit_breakpoint_address = 0;
+    }
+
+    // do continue
     ptrace(PTRACE_CONT, child_pid, nullptr, nullptr);
     waitpid(child_pid, &status, 0);
     if (WIFEXITED(status)) {
@@ -298,14 +316,6 @@ void cont() {
         child_pid = -1;
 
     } else if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-        // Reset breakpoint
-        if (hit_breakpoint_address != 0) {
-            long data = ptrace(PTRACE_PEEKTEXT, child_pid, hit_breakpoint_address, 0);
-            long trap = (data & ~0xFF) | 0xCC;
-            ptrace(PTRACE_POKETEXT, child_pid, hit_breakpoint_address, trap);
-            hit_breakpoint_address = 0;
-        }
-
         check_breakpoint(false);
         struct user_regs_struct regs;
         ptrace(PTRACE_GETREGS, child_pid, 0, &regs);
